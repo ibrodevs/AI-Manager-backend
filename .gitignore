@@ -9,3 +9,9 @@ __pycache__/
 staticfiles/
 *.log
 .DS_Store
+
+# Optional Node.js dependencies for preserved backend services
+node_modules/
+legacy/**/node_modules/
+legacy/.turbo/
+legacy/coverage/
