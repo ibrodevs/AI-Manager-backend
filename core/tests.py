@@ -635,10 +635,17 @@ class StabilizationRegressionTests(TestCase):
     def test_staff_cannot_reassign_call_through_resource_api(self):
         call = m.Call.objects.create(company=self.a, assignee=self.staff, caller="+996555000001")
         self.login(self.staff)
-        response = self.client.patch(
-            f"/api/v1/calls/{call.pk}/", {"assigneeId": str(self.owner.pk)}, format="json"
-        )
-        self.assertEqual(response.status_code, 403, response.data)
+        for patch in [{"assigneeId": str(self.owner.pk)},
+                      {"assignee_id": str(self.owner.pk)},
+                      {"assignee": str(self.owner.pk)},
+                      {"assigneeId": str(self.staff.pk), "assignee": str(self.owner.pk)}]:
+            with self.subTest(patch=patch):
+                response = self.client.patch(f"/api/v1/calls/{call.pk}/", patch, format="json")
+                self.assertEqual(response.status_code, 403, response.data)
+        hidden = m.Contact.objects.create(company=self.a, phone="+996555000099", name="Owner only")
+        for key in ("contactId", "contact_id", "contact"):
+            response = self.client.patch(f"/api/v1/calls/{call.pk}/", {key: str(hidden.pk)}, format="json")
+            self.assertEqual(response.status_code, 404, response.data)
         call.refresh_from_db()
         self.assertEqual(call.assignee_id, self.staff.pk)
 
@@ -728,3 +735,11 @@ class StabilizationRegressionTests(TestCase):
         self.assertEqual(r.status_code, 200, r.data)
         self.assertTrue(m.Lead.objects.filter(pk=r.data["id"], source="chat", source_id=conversation_id).exists())
         self.assertEqual(m.Message.objects.get(conversation_id=conversation_id).body, "Хочу записаться")
+
+    def test_malformed_command_objects_are_validation_errors(self):
+        for name, args in [("createLead", [None]), ("createContact", [42]),
+                           ("updateCompany", ["invalid"]), ("upsertFaq", [[None]]),
+                           ("updateLead", ["id", []])]:
+            with self.subTest(name=name):
+                response = self.cmd(name, *args)
+                self.assertEqual(response.status_code, 400, response.data)

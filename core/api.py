@@ -555,12 +555,34 @@ class CommandInput(serializers.Serializer):
     )
 
 
+    def validate_args(self, args):
+        name = self.context.get("name")
+        object_at = 0 if name in {
+            "assistantCommit", "createLead", "createContact", "updateAssistant",
+            "updateCompany", "inviteMember", "createAppointment", "addToWaitlist",
+            "simulateClientMessage",
+        } else 1 if name in {
+            "updateLead", "bulkUpdateLeads", "updateContact", "updateNumber",
+            "updateMember", "moveAppointment", "sendMessage",
+        } else None
+        if object_at is not None and (
+            len(args) <= object_at or not isinstance(args[object_at], dict)
+        ):
+            raise ValidationError("Ожидается объект параметров команды.")
+        if name in {"upsertServices", "upsertStaff", "upsertFaq"} and (
+            not args or not isinstance(args[0], list)
+            or any(not isinstance(row, dict) for row in args[0])
+        ):
+            raise ValidationError("Ожидается список объектов.")
+        return args
+
+
 class CommandView(APIView):
     @extend_schema(request=CommandInput, responses=OpenApiTypes.OBJECT)
     @transaction.atomic
     def post(self, request, name):
         c = context(request)
-        v = CommandInput(data=request.data)
+        v = CommandInput(data=request.data, context={"name": name})
         v.is_valid(raise_exception=True)
         args = v.validated_data["args"]
         if name in [
@@ -1353,9 +1375,13 @@ def make_viewset(model, access, readonly):
             if model is m.Lead:
                 return Response(serialize(s.update_lead(c, kwargs["pk"], request.data)))
             if model is m.Call and c.member.role == "staff":
-                assignee = request.data.get("assigneeId", request.data.get("assignee_id", request.data.get("assignee")))
-                if assignee is not None and str(assignee) != str(c.user.pk):
-                    raise PermissionDenied("Нельзя назначать звонки другому сотруднику.")
+                for key in ("assigneeId", "assignee_id", "assignee"):
+                    assignee = request.data.get(key)
+                    if assignee is not None and str(assignee) != str(c.user.pk):
+                        raise PermissionDenied("Нельзя назначать звонки другому сотруднику.")
+                for key in ("contactId", "contact_id", "contact"):
+                    if request.data.get(key):
+                        s.obj(c, m.Contact, request.data[key])
             return super().partial_update(request, *args, **kwargs)
 
         def perform_update(self, serializer):
@@ -1441,6 +1467,8 @@ class ProviderEventView(APIView):
         if not hmac.compare_digest(signature, expected):
             raise PermissionDenied("Неверная подпись.")
         data = request.data
+        if not isinstance(data, dict):
+            raise ValidationError("Ожидается JSON-объект события.")
         try:
             uuid.UUID(str(data.get("companyId")))
         except ValueError:
