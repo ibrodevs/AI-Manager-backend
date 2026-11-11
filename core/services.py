@@ -222,23 +222,25 @@ def publish(ctx, rollback=None):
         q.fields = old.fields
         q.snapshot = old.snapshot
         q.completeness = old.completeness
-        # Restore editable tables atomically while old snapshots stay immutable.
-        for key, model in [
-            ("services", m.Service),
-            ("staff", m.Staff),
-            ("faq", m.Faq),
-            ("branches", m.Branch),
-        ]:
+        # Recreate stable IDs before validating cross-table links. Services and
+        # staff can refer to each other through JSON ID lists.
+        tables = [("branches", m.Branch), ("services", m.Service),
+                  ("staff", m.Staff), ("faq", m.Faq)]
+        for key, model in tables:
             for row in old.snapshot.get(key, []):
-                existing = model.objects.filter(
-                    company=ctx.company, pk=row["id"]
-                ).first()
-                save(
-                    ctx,
-                    model,
-                    {k: v for k, v in row.items() if k not in ["id", "createdAt"]},
-                    existing,
-                )
+                existing = model.objects.filter(company=ctx.company, pk=row["id"]).first()
+                data = {k: v for k, v in row.items() if k not in ["id", "createdAt"]}
+                if model is m.Service:
+                    data = {**data, "staffIds": []}
+                save(ctx, model, data, existing or model(id=row["id"], company=ctx.company))
+        for key, model in tables:
+            for row in old.snapshot.get(key, []):
+                save(ctx, model,
+                     {k: v for k, v in row.items() if k not in ["id", "createdAt"]},
+                     model.objects.get(company=ctx.company, pk=row["id"]))
+            model.objects.filter(company=ctx.company).exclude(
+                pk__in=[row["id"] for row in old.snapshot.get(key, [])]
+            ).delete()
     else:
         missing = required_missing(state, assistant(ctx)["mode"])
         if missing:

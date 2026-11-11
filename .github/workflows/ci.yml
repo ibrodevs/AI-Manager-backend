@@ -11,7 +11,12 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
         ports: ['5432:5432']
-        options: --health-cmd 'pg_isready -U postgres' --health-interval 5s --health-timeout 5s --health-retries 15
+        # Runner options are not parsed by a shell: single quotes do not group arguments.
+        options: >-
+          --health-cmd=pg_isready
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
     env:
       DJANGO_DEBUG: '1'
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/allmanager
@@ -20,6 +25,14 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.12'}
       - run: pip install -r requirements.txt
+      - name: Verify PostgreSQL connection before tests
+        run: |
+          python - <<'PYTHON'
+          import os, psycopg
+          with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=5) as conn:
+              assert conn.execute("SELECT 1").fetchone() == (1,)
+              print("PostgreSQL connection verified")
+          PYTHON
       - run: python manage.py test core --noinput
       - run: python manage.py makemigrations --check --dry-run
       - run: python manage.py spectacular --file /tmp/openapi.yaml --validate --fail-on-warn

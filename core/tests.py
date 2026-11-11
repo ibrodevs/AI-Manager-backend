@@ -609,3 +609,173 @@ class ProviderAndInviteTests(TestCase):
         deliver_outbox()
         job.refresh_from_db()
         self.assertEqual(job.status, "unconfigured")
+
+
+class StabilizationRegressionTests(TestCase):
+    setUp = BusinessAPITests.setUp
+    login = BusinessAPITests.login
+    cmd = BusinessAPITests.cmd
+    read = BusinessAPITests.read
+    complete_kb = BusinessAPITests.complete_kb
+
+    def test_accountant_cannot_rewrite_platform_invoice(self):
+        now = timezone.now()
+        invoice = m.Invoice.objects.create(
+            company=self.a, number="INV-1", period_start=now,
+            period_end=now + timedelta(days=30), amount_minor=10000,
+        )
+        self.login(self.accountant)
+        response = self.client.patch(
+            f"/api/v1/invoices/{invoice.pk}/", {"amountMinor": 1}, format="json"
+        )
+        self.assertEqual(response.status_code, 403, response.data)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.amount_minor, 10000)
+
+    def test_staff_cannot_reassign_call_through_resource_api(self):
+        call = m.Call.objects.create(company=self.a, assignee=self.staff, caller="+996555000001")
+        self.login(self.staff)
+        for patch in [{"assigneeId": str(self.owner.pk)},
+                      {"assignee_id": str(self.owner.pk)},
+                      {"assignee": str(self.owner.pk)},
+                      {"assigneeId": str(self.staff.pk), "assignee": str(self.owner.pk)}]:
+            with self.subTest(patch=patch):
+                response = self.client.patch(f"/api/v1/calls/{call.pk}/", patch, format="json")
+                self.assertEqual(response.status_code, 403, response.data)
+        hidden = m.Contact.objects.create(company=self.a, phone="+996555000099", name="Owner only")
+        for key in ("contactId", "contact_id", "contact"):
+            response = self.client.patch(f"/api/v1/calls/{call.pk}/", {key: str(hidden.pk)}, format="json")
+            self.assertEqual(response.status_code, 404, response.data)
+        call.refresh_from_db()
+        self.assertEqual(call.assignee_id, self.staff.pk)
+
+    def test_rollback_restores_deleted_rows_ids_links_and_removes_new_rows(self):
+        q = self.complete_kb()
+        branch = m.Branch.objects.create(company=self.a, name="Original branch")
+        service = m.Service.objects.get(company=self.a)
+        staff = m.Staff.objects.create(company=self.a, name="Original staff", branch=branch, service_ids=[str(service.pk)])
+        service.staff_ids = [str(staff.pk)]
+        service.branch_ids = [str(branch.pk)]
+        service.save()
+        self.assertEqual(self.cmd("publishQuestionnaire").status_code, 200)
+        q.refresh_from_db()
+        snapshot = q.snapshot
+        service_id, staff_id, branch_id = service.pk, staff.pk, branch.pk
+        service.delete()
+        staff.delete()
+        branch.delete()
+        extra = m.Service.objects.create(company=self.a, name="Unpublished", price_type="exact", price_min=500)
+        r = self.cmd("rollbackQuestionnaire", 1)
+        self.assertEqual(r.status_code, 200, r.data)
+        restored = m.Service.objects.get(pk=service_id)
+        self.assertEqual(restored.staff_ids, [str(staff_id)])
+        self.assertEqual(restored.branch_ids, [str(branch_id)])
+        self.assertEqual(m.Staff.objects.get(pk=staff_id).service_ids, [str(service_id)])
+        self.assertFalse(m.Service.objects.filter(pk=extra.pk).exists())
+        q.refresh_from_db()
+        self.assertEqual(q.snapshot, snapshot)
+
+    def test_unknown_routes_and_bad_command_args_do_not_claim_success(self):
+        self.assertEqual(self.cmd("doesNotExist").status_code, 400)
+        self.assertEqual(self.read("doesNotExist").status_code, 404)
+        self.assertEqual(self.cmd("createLead").status_code, 400)
+
+    def test_sessions_all_devices_and_inactive_user(self):
+        tokens = [issue_session(self.owner, True) for _ in range(2)]
+        self.assertEqual(self.client.delete("/api/v1/auth/sessions/").status_code, 204)
+        for token in tokens:
+            self.client.credentials(HTTP_AUTHORIZATION="Bearer " + token)
+            self.assertEqual(self.read("getCompany").status_code, 401)
+        self.login(self.owner)
+        self.owner.is_active = False
+        self.owner.save()
+        self.assertEqual(self.read("getCompany").status_code, 401)
+
+    def test_provider_signature_binds_tenant_payload_and_timestamp(self):
+        import hashlib, hmac, json, time
+        from django.test import override_settings
+        data = {"companyId": str(self.a.pk), "eventId": "signed-event", "kind": "chat.inbound", "channel": "widget", "externalId": "chat-1", "body": "Hello"}
+        raw = json.dumps(data).encode()
+        stamp = str(int(time.time()))
+        def send(body, timestamp, signature):
+            return APIClient().post("/api/v1/provider-events/", body, content_type="application/json", HTTP_X_WEBHOOK_TIMESTAMP=timestamp, HTTP_X_WEBHOOK_SIGNATURE=signature)
+        def sign(timestamp, body):
+            return hmac.new(b"test-only", timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+        with override_settings(WEBHOOK_SECRET=""):
+            self.assertEqual(send(raw, stamp, sign(stamp, raw)).status_code, 503)
+        with override_settings(WEBHOOK_SECRET="test-only"):
+            stale = str(int(time.time()) - 301)
+            self.assertEqual(send(raw, stale, sign(stale, raw)).status_code, 403)
+            foreign = json.dumps({**data, "companyId": str(self.b.pk)}).encode()
+            self.assertEqual(send(foreign, stamp, sign(stamp, raw)).status_code, 403)
+            self.assertEqual(send(raw, stamp, sign(stamp, raw)).status_code, 201)
+            self.assertTrue(send(raw, stamp, sign(stamp, raw)).data["duplicate"])
+        self.assertEqual(m.Message.objects.filter(company=self.a).count(), 1)
+        self.assertFalse(m.Message.objects.filter(company=self.b).exists())
+
+    def test_move_appointment_preserves_timezone_instant_and_cancel_frees_slot(self):
+        start = (timezone.now() + timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0)
+        data = {"resourceId": str(self.resource.pk), "startsAt": start.isoformat(), "durationMin": 60, "contactPhone": "+996555000001"}
+        r = self.cmd("createAppointment", data)
+        self.assertEqual(r.status_code, 200, r.data)
+        moved = (start + timedelta(hours=2)).astimezone(__import__('zoneinfo').ZoneInfo("Asia/Bishkek"))
+        r = self.cmd("moveAppointment", r.data["id"], {"startsAt": moved.isoformat()})
+        self.assertEqual(r.status_code, 200, r.data)
+        appointment = m.Appointment.objects.get(pk=r.data["id"])
+        self.assertEqual(appointment.starts_at, start + timedelta(hours=2))
+        self.assertEqual(self.cmd("setAppointmentStatus", str(appointment.pk), "cancelled").status_code, 200)
+        self.assertEqual(self.cmd("createAppointment", {**data, "startsAt": moved.isoformat()}).status_code, 200)
+
+    def test_inbound_chat_takeover_creates_real_lead(self):
+        r = self.cmd("simulateClientMessage", {"channel": "widget", "body": "Хочу записаться"})
+        self.assertEqual(r.status_code, 200, r.data)
+        conversation_id = r.data["id"]
+        self.assertEqual(self.cmd("takeChat", conversation_id).status_code, 200)
+        r = self.cmd("createLeadFromChat", conversation_id, "Запись из чата")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(m.Lead.objects.filter(pk=r.data["id"], source="chat", source_id=conversation_id).exists())
+        self.assertEqual(m.Message.objects.get(conversation_id=conversation_id).body, "Хочу записаться")
+
+    def test_malformed_command_objects_are_validation_errors(self):
+        for name, args in [("createLead", [None]), ("createContact", [42]),
+                           ("updateCompany", ["invalid"]), ("upsertFaq", [[None]]),
+                           ("updateLead", ["id", []])]:
+            with self.subTest(name=name):
+                response = self.cmd(name, *args)
+                self.assertEqual(response.status_code, 400, response.data)
+
+    def test_foreign_leads_calls_and_contacts_are_hidden_and_immutable(self):
+        lead = m.Lead.objects.create(company=self.b, number=1, type="other", title="Foreign secret")
+        call = m.Call.objects.create(company=self.b, caller="+996555000002", summary="Foreign call")
+        for resource, obj in [("leads", lead), ("calls", call), ("contacts", self.foreign)]:
+            with self.subTest(resource=resource):
+                self.assertEqual(self.client.get(f"/api/v1/{resource}/{obj.pk}/").status_code, 404)
+                self.assertEqual(self.client.patch(f"/api/v1/{resource}/{obj.pk}/", {"name": "Changed", "title": "Changed", "summary": "Changed"}, format="json").status_code, 404)
+                response = self.client.get(f"/api/v1/{resource}/")
+                self.assertEqual(response.status_code, 200)
+                self.assertFalse(any(str(row["id"]) == str(obj.pk) for row in response.data["results"]))
+        self.assertEqual(self.cmd("updateLead", str(lead.pk), {"status": "won"}).status_code, 404)
+        lead.refresh_from_db()
+        self.assertEqual(lead.status, "new")
+
+    def test_platform_admin_requires_superuser_and_totp_without_replay(self):
+        from django.test import Client
+        from .auth import cipher
+        admin = get_user_model().objects.create_superuser(
+            username="platform@example.com", email="platform@example.com", password="Strong-pass-9238"
+        )
+        secret = pyotp.random_base32()
+        m.MFADevice.objects.create(user=admin, confirmed=True, encrypted_secret=cipher().encrypt(secret.encode()).decode())
+        client = Client()
+        client.force_login(admin)
+        self.assertEqual(client.get("/admin/").status_code, 302)
+        client.logout()
+        payload = {"username": admin.username, "password": "Strong-pass-9238", "otp": pyotp.TOTP(secret).now()}
+        response = client.post("/admin/login/?next=/admin/", payload)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(client.get("/admin/").status_code, 200)
+        client.logout()
+        self.assertEqual(client.post("/admin/login/?next=/admin/", payload).status_code, 200)
+        self.assertFalse(client.session.get("admin_mfa", False))
+        client.force_login(self.staff)
+        self.assertEqual(client.get("/admin/").status_code, 302)
