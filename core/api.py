@@ -1346,9 +1346,16 @@ def make_viewset(model, access, readonly):
 
         @transaction.atomic
         def partial_update(self, request, *args, **kwargs):
+            c = context(request)
+            s.demand(c, access)
+            if model is m.Invoice:
+                raise PermissionDenied("Счета изменяет только платформа.")
             if model is m.Lead:
-                c = context(request)
                 return Response(serialize(s.update_lead(c, kwargs["pk"], request.data)))
+            if model is m.Call and c.member.role == "staff":
+                assignee = request.data.get("assigneeId", request.data.get("assignee_id", request.data.get("assignee")))
+                if assignee is not None and str(assignee) != str(c.user.pk):
+                    raise PermissionDenied("Нельзя назначать звонки другому сотруднику.")
             return super().partial_update(request, *args, **kwargs)
 
         def perform_update(self, serializer):
