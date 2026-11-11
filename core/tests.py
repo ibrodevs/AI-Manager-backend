@@ -743,3 +743,39 @@ class StabilizationRegressionTests(TestCase):
             with self.subTest(name=name):
                 response = self.cmd(name, *args)
                 self.assertEqual(response.status_code, 400, response.data)
+
+    def test_foreign_leads_calls_and_contacts_are_hidden_and_immutable(self):
+        lead = m.Lead.objects.create(company=self.b, number=1, type="other", title="Foreign secret")
+        call = m.Call.objects.create(company=self.b, caller="+996555000002", summary="Foreign call")
+        for resource, obj in [("leads", lead), ("calls", call), ("contacts", self.foreign)]:
+            with self.subTest(resource=resource):
+                self.assertEqual(self.client.get(f"/api/v1/{resource}/{obj.pk}/").status_code, 404)
+                self.assertEqual(self.client.patch(f"/api/v1/{resource}/{obj.pk}/", {"name": "Changed", "title": "Changed", "summary": "Changed"}, format="json").status_code, 404)
+                response = self.client.get(f"/api/v1/{resource}/")
+                self.assertEqual(response.status_code, 200)
+                self.assertFalse(any(str(row["id"]) == str(obj.pk) for row in response.data["results"]))
+        self.assertEqual(self.cmd("updateLead", str(lead.pk), {"status": "won"}).status_code, 404)
+        lead.refresh_from_db()
+        self.assertEqual(lead.status, "new")
+
+    def test_platform_admin_requires_superuser_and_totp_without_replay(self):
+        from django.test import Client
+        from .auth import cipher
+        admin = get_user_model().objects.create_superuser(
+            username="platform@example.com", email="platform@example.com", password="Strong-pass-9238"
+        )
+        secret = pyotp.random_base32()
+        m.MFADevice.objects.create(user=admin, confirmed=True, encrypted_secret=cipher().encrypt(secret.encode()).decode())
+        client = Client()
+        client.force_login(admin)
+        self.assertEqual(client.get("/admin/").status_code, 302)
+        client.logout()
+        payload = {"username": admin.username, "password": "Strong-pass-9238", "otp": pyotp.TOTP(secret).now()}
+        response = client.post("/admin/login/?next=/admin/", payload)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(client.get("/admin/").status_code, 200)
+        client.logout()
+        self.assertEqual(client.post("/admin/login/?next=/admin/", payload).status_code, 200)
+        self.assertFalse(client.session.get("admin_mfa", False))
+        client.force_login(self.staff)
+        self.assertEqual(client.get("/admin/").status_code, 302)
